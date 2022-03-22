@@ -9,6 +9,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .activelearning import MyStrategy
+from .strategy import MyStrategy
 from .infer import MyInfer
 from .train import MyTrain
