@@ -10,17 +10,7 @@
 # limitations under the License.
 from typing import Callable, Sequence
 
-from monai.inferers import SlidingWindowInferer
-from monai.transforms import (
-    Activationsd,
-    AddChanneld,
-    AsDiscreted,
-    LoadImaged,
-    ScaleIntensityRanged,
-    Spacingd,
-    ToNumpyd,
-    ToTensord,
-)
+import monai
 
 from monailabel.interfaces.tasks.infer import InferTask, InferType
 from monailabel.transform.post import BoundingBoxd, Restored
@@ -28,17 +18,19 @@ from monailabel.transform.post import BoundingBoxd, Restored
 
 class MyInfer(InferTask):
     """
-    This provides Inference Engine for pre-trained segmentation (UNet) model over MSD Dataset.
+    Custom infer task
     """
 
     def __init__(
         self,
         path,
-        network=None,
-        type=InferType.SEGMENTATION,
-        labels="generic",
-        dimension=3,
-        description="A pre-trained model for volumetric (3D) segmentation over 3D Images",
+        network,
+        image_size,
+        # I believe the following are just for logging a description
+        labels=["background", "lung"],
+        dimension=2,
+        description="LungAIR infer task",
+        type=InferType.SEGMENTATION, # This one only seems to matter if it's SCRIBBLES
     ):
         super().__init__(
             path=path,
@@ -48,24 +40,29 @@ class MyInfer(InferTask):
             dimension=dimension,
             description=description,
         )
+        self.image_size = image_size
 
     def pre_transforms(self, data=None) -> Sequence[Callable]:
+        keys = "image"
         return [
-            LoadImaged(keys="image"),
-            AddChanneld(keys="image"),
-            Spacingd(keys="image", pixdim=[1.0, 1.0, 1.0]),
-            ScaleIntensityRanged(keys="image", a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
-            ToTensord(keys="image"),
+            monai.transforms.LoadImageD(reader='itkreader', keys=keys),
+            monai.transforms.TransposeD(indices = (2,1,0), keys=keys),
+            monai.transforms.ResizeD(
+                spatial_size=(self.image_size,self.image_size),
+                mode = "bilinear",
+                align_corners = False,
+                keys=keys
+            ),
+            monai.transforms.ToTensorD(keys=keys),
+            monai.transforms.AddChanneld(keys=keys),
         ]
 
     def inferer(self, data=None) -> Callable:
-        return SlidingWindowInferer(roi_size=[160, 160, 160])
+        return monai.inferers.SimpleInferer()
 
     def post_transforms(self, data=None) -> Sequence[Callable]:
         return [
-            Activationsd(keys="pred", softmax=True),
-            AsDiscreted(keys="pred", argmax=True),
-            ToNumpyd(keys="pred"),
-            Restored(keys="pred", ref_image="image"),
-            BoundingBoxd(keys="pred", result="result", bbox="bbox"),
+            monai.transforms.ActivationsD(keys="pred", softmax=True),
+            monai.transforms.AsDiscreteD(keys="pred", argmax=True),
+            monai.transforms.ToNumpyd(keys="pred"),
         ]

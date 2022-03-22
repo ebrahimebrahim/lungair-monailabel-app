@@ -11,23 +11,8 @@
 
 import logging
 
-from monai.inferers import SlidingWindowInferer
-from monai.losses import DiceCELoss
-from monai.optimizers import Novograd
-from monai.transforms import (
-    Activationsd,
-    AddChanneld,
-    AsDiscreted,
-    CropForegroundd,
-    EnsureTyped,
-    LoadImaged,
-    RandCropByPosNegLabeld,
-    RandShiftIntensityd,
-    ScaleIntensityRanged,
-    Spacingd,
-    ToDeviced,
-    ToTensord,
-)
+import monai
+import numpy as np
 
 from monailabel.tasks.train.basic_train import BasicTrainTask, Context
 
@@ -39,78 +24,106 @@ class MyTrain(BasicTrainTask):
         self,
         model_dir,
         network,
+        image_size,
         description="Train generic Segmentation model",
         **kwargs,
     ):
         self._network = network
+        self.image_size = image_size
         super().__init__(model_dir, description, **kwargs)
 
     def network(self, context: Context):
         return self._network
 
     def optimizer(self, context: Context):
-        return Novograd(self._network.parameters(), 0.0001)
+        return monai.optimizers.Novograd(self._network.parameters(), 0.0001)
 
     def loss_function(self, context: Context):
-        return DiceCELoss(to_onehot_y=True, softmax=True, squared_pred=True, batch=True)
+        return monai.losses.DiceLoss(
+            # unlike in the jupyter notebook version of our lung seg exploration, here the labels are expected to not be in one-hot form
+            # (TODO: pay attention to this part and make sure it's correct)
+            to_onehot_y = True,
+            # Note that our segmentation network is missing the softmax at the end. However a softmax occurs below
+            # in the train_post_transforms. However train_post_transforms doesn't seem to matter for this.
+            # Maybe train_post_transforms is for transforms to apply in order to examine the result of training? Unclear.
+            softmax = True,
+        )
 
     def train_pre_transforms(self, context: Context):
+        keys = ['image', 'label']
+        sampling_modes = ['blinear', 'nearest']
+        align_corners = [False, None]
         t = [
-            LoadImaged(keys=("image", "label")),
-            AddChanneld(keys=("image", "label")),
-            Spacingd(
-                keys=("image", "label"),
-                pixdim=(1.0, 1.0, 1.0),
-                mode=("bilinear", "nearest"),
+            monai.transforms.LoadImageD(reader='itkreader', keys=keys),
+            monai.transforms.TransposeD(indices = (2,1,0), keys=keys),
+            monai.transforms.ResizeD(
+                spatial_size=(self.image_size,self.image_size),
+                mode = sampling_modes,
+                align_corners = align_corners,
+                keys=keys
             ),
-            ScaleIntensityRanged(keys="image", a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
-            CropForegroundd(keys=("image", "label"), source_key="image"),
+            monai.transforms.ToTensorD(keys=keys),
         ]
         if context.request.get("to_gpu", False):
-            t.extend([EnsureTyped(keys=("image", "label")), ToDeviced(keys=("image", "label"), device=context.device)])
+            t.extend([monai.transforms.ToDeviceD(keys=keys, device=context.device)])
         t.extend(
             [
-                RandCropByPosNegLabeld(
-                    keys=("image", "label"),
-                    label_key="label",
-                    spatial_size=(96, 96, 96),
-                    pos=1,
-                    neg=1,
-                    num_samples=4,
-                    image_key="image",
-                    image_threshold=0,
+                monai.transforms.RandZoomD( keys=keys,
+                    mode = sampling_modes,
+                    align_corners = align_corners,
+                    prob=1.,
+                    padding_mode="constant",
+                    min_zoom = 0.7,
+                    max_zoom=1.3,
                 ),
-                RandShiftIntensityd(keys="image", offsets=0.1, prob=0.5),
+                monai.transforms.RandRotateD( keys=keys,
+                    mode = sampling_modes,
+                    align_corners = align_corners,
+                    prob=1.,
+                    range_x = np.pi/8,
+                    padding_mode="zeros",
+                ),
+                monai.transforms.RandGaussianSmoothD( keys=keys,
+                    prob = 0.4
+                ),
+                monai.transforms.RandAdjustContrastD( keys=keys,
+                    prob=0.4,
+                ),
             ]
         )
         return t
 
     def train_post_transforms(self, context: Context):
         return [
-            ToTensord(keys=("pred", "label")),
-            Activationsd(keys="pred", softmax=True),
-            AsDiscreted(
+            monai.transforms.ToTensorD(keys=("pred", "label")),
+            monai.transforms.ActivationsD(keys="pred", softmax=True),
+            monai.transforms.AsDiscreteD(
                 keys=("pred", "label"),
                 argmax=(True, False),
-                to_onehot=True,
-                n_classes=2,
+                to_onehot=2,
             ),
         ]
 
     def val_pre_transforms(self, context: Context):
+        keys = ['image', 'label']
+        sampling_modes = ['blinear', 'nearest']
+        align_corners = [False, None]
         return [
-            LoadImaged(keys=("image", "label")),
-            AddChanneld(keys=("image", "label")),
-            Spacingd(
-                keys=("image", "label"),
-                pixdim=(1.0, 1.0, 1.0),
-                mode=("bilinear", "nearest"),
+            monai.transforms.LoadImageD(reader='itkreader', keys=keys),
+            monai.transforms.TransposeD(indices = (2,1,0), keys=keys),
+            monai.transforms.ResizeD(
+                spatial_size=(self.image_size,self.image_size),
+                mode = sampling_modes,
+                align_corners = align_corners,
+                keys=keys
             ),
-            ScaleIntensityRanged(keys="image", a_min=-57, a_max=164, b_min=0.0, b_max=1.0, clip=True),
-            CropForegroundd(keys=("image", "label"), source_key="image"),
-            EnsureTyped(keys=("image", "label")),
-            ToDeviced(keys=("image", "label"), device=context.device),
+            monai.transforms.ToTensorD(keys=keys),
+            monai.transforms.AddChanneld(keys=("image")),
+            monai.transforms.ToDeviceD(keys=("image", "label"), device=context.device),
         ]
 
+    # Not overriding val_post_transforms means we accept that val_post_transforms simply
+    # calls train_post_transforms; i.e. it does the argmax etc.
+
     def val_inferer(self, context: Context):
-        return SlidingWindowInferer(roi_size=(160, 160, 160), sw_batch_size=1, overlap=0.25)
+        return monai.inferers.SimpleInferer()
